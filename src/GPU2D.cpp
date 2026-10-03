@@ -668,10 +668,53 @@ void GPU2D::UpdateWindows(u32 line)
     else if (line == Win1Coords[2]) Win1Active |=  0x1;
 }
 
+// Applies one rectangular window to the line's window mask.
+// This is the span form of the per-pixel state machine
+//     if (i == x2) h = 0; else if (i == x1) h = 1;   // updated before the test at i
+//     if (v && h) mask[i] = val;
+// where bit0 of 'active' is the vertical state (constant over the line) and
+// bit1 the horizontal state carried between lines.
+static void ApplyWindowSpans(u8* windowMask, u8& active, u8 x1, u8 x2, u8 val)
+{
+    const bool v = (active & 0x1) != 0;
+    bool h = (active & 0x2) != 0;
+
+    // events in position order; at an equal position only the x2 event applies
+    int pos[2];
+    bool nh[2];
+    int n = 0;
+    if (x1 == x2)
+    {
+        pos[0] = x2; nh[0] = false; n = 1;
+    }
+    else if (x1 < x2)
+    {
+        pos[0] = x1; nh[0] = true;
+        pos[1] = x2; nh[1] = false; n = 2;
+    }
+    else
+    {
+        pos[0] = x2; nh[0] = false;
+        pos[1] = x1; nh[1] = true; n = 2;
+    }
+
+    int cur = 0;
+    for (int e = 0; e < n; e++)
+    {
+        if (v && h && pos[e] > cur)
+            memset(&windowMask[cur], val, pos[e] - cur);
+        h = nh[e];
+        cur = pos[e];
+    }
+    if (v && h)
+        memset(&windowMask[cur], val, 256 - cur);
+
+    active = (active & ~0x2) | (h ? 0x2 : 0);
+}
+
 void GPU2D::CalculateWindowMask(u8* windowMask, const u8* objWindow)
 {
-    for (u32 i = 0; i < 256; i++)
-        windowMask[i] = WinCnt[2]; // window outside
+    memset(windowMask, WinCnt[2], 256); // window outside
 
     if (DispCnt & (1<<15))
     {
@@ -686,31 +729,13 @@ void GPU2D::CalculateWindowMask(u8* windowMask, const u8* objWindow)
     if (DispCnt & (1<<14))
     {
         // window 1
-        u8 x1 = Win1Coords[0];
-        u8 x2 = Win1Coords[1];
-
-        for (int i = 0; i < 256; i++)
-        {
-            if (i == x2)      Win1Active &= ~0x2;
-            else if (i == x1) Win1Active |=  0x2;
-
-            if (Win1Active == 0x3) windowMask[i] = WinCnt[1];
-        }
+        ApplyWindowSpans(windowMask, Win1Active, Win1Coords[0], Win1Coords[1], WinCnt[1]);
     }
 
     if (DispCnt & (1<<13))
     {
         // window 0
-        u8 x1 = Win0Coords[0];
-        u8 x2 = Win0Coords[1];
-
-        for (int i = 0; i < 256; i++)
-        {
-            if (i == x2)      Win0Active &= ~0x2;
-            else if (i == x1) Win0Active |=  0x2;
-
-            if (Win0Active == 0x3) windowMask[i] = WinCnt[0];
-        }
+        ApplyWindowSpans(windowMask, Win0Active, Win0Coords[0], Win0Coords[1], WinCnt[0]);
     }
 }
 

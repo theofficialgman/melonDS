@@ -59,6 +59,9 @@ private:
     alignas(8) u8 OBJWindow[256];
 
     u32 NumSprites;
+    u8 OBJOpaquePrios; // bit n set if the OBJ line holds an opaque pixel of BG priority n
+    u32 CompositeLUTKey = 0xFFFFFFFF; // BlendCnt the LUT below was built for
+    bool CompositeCanEffect[256];     // can a top pixel with this flag byte be changed by a color effect
 
     u8* CurBGXMosaicTable;
     array2d<u8, 16, 256> MosaicTable = []() constexpr

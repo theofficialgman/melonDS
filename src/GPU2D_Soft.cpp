@@ -346,14 +346,48 @@ void SoftRenderer2D::DrawScanline_BGOBJ(u32 line, u32* dst)
     }
 
     // color special effects
-    // can likely be optimized
+    const u32 blendCnt = GPU2D.BlendCnt;
 
-    for (int i = 0; i < 256; i++)
+    if ((blendCnt & 0x3F00) == 0 && ((blendCnt >> 6) & 0x3) < 2)
     {
-        u32 val1 = BGOBJLine[i];
-        u32 val2 = BGOBJLine[256+i];
+        // no layer is a second blend target and no brightness effect is selected,
+        // so ColorComposite() would return the top pixel unchanged everywhere
+        for (int i = 0; i < 256; i++)
+            dst[i] = BGOBJLine[i];
+    }
+    else
+    {
+        if (CompositeLUTKey != blendCnt)
+        {
+            // conservative: true wherever any branch of ColorComposite() could choose an effect
+            const bool target2Any = (blendCnt & 0x3F00) != 0;
+            const bool effectSelected = ((blendCnt >> 6) & 0x3) != 0;
+            for (u32 f = 0; f < 256; f++)
+            {
+                bool can = false;
+                if ((f & 0x80) && target2Any) can = true;
+                if ((f & 0x40) && target2Any) can = true;
+                u32 m = f;
+                if      (m & 0x80) m = 0x10;
+                else if (m & 0x40) m = 0x01;
+                if ((blendCnt & m) && effectSelected) can = true;
+                CompositeCanEffect[f] = can;
+            }
+            CompositeLUTKey = blendCnt;
+        }
 
-        dst[i] = ColorComposite(i, val1, val2);
+        for (int i = 0; i < 256; i++)
+        {
+            u32 val1 = BGOBJLine[i];
+            if (!CompositeCanEffect[val1 >> 24])
+            {
+                dst[i] = val1;
+                continue;
+            }
+
+            u32 val2 = BGOBJLine[256+i];
+            dst[i] = ColorComposite(i, val1, val2);
+        }
     }
 }
 
@@ -808,6 +842,8 @@ void SoftRenderer2D::DrawBG_Extended(u32 line, u32 bgnum)
 
         yshift -= 3;
 
+        u32 lasttileidx = 0xFFFFFFFF;
+
         for (int i = 0; i < 256; i++)
         {
             if (WindowMask[i] & (1<<bgnum))
@@ -827,10 +863,16 @@ void SoftRenderer2D::DrawBG_Extended(u32 line, u32 bgnum)
 
                 if ((!((finalX|finalY) & overflowmask)))
                 {
-                    curtile = *(u16*)&bgvram[(tilemapaddr + (((((finalY & coordmask) >> 11) << yshift) + ((finalX & coordmask) >> 11)) << 1)) & bgvrammask];
+                    // consecutive pixels usually fall in the same map tile
+                    u32 tileidx = (((finalY & coordmask) >> 11) << yshift) + ((finalX & coordmask) >> 11);
+                    if (tileidx != lasttileidx)
+                    {
+                        lasttileidx = tileidx;
+                        curtile = *(u16*)&bgvram[(tilemapaddr + (tileidx << 1)) & bgvrammask];
 
-                    if (extpal) curpal = GPU2D.GetBGExtPal(bgnum, curtile>>12);
-                    else        curpal = pal;
+                        if (extpal) curpal = GPU2D.GetBGExtPal(bgnum, curtile>>12);
+                        else        curpal = pal;
+                    }
 
                     // draw pixel
                     u32 tilexoff = (finalX >> 8) & 0x7;
@@ -983,6 +1025,9 @@ void SoftRenderer2D::ApplySpriteMosaicX()
 
 void SoftRenderer2D::InterleaveSprites(u32 prio)
 {
+    if (!(OBJOpaquePrios & (1u << prio)))
+        return;
+
     u32 attrmask = (prio << 16) | OBJ_IsOpaque;
     u16* pal = (u16*)&GPU.Palette[GPU2D.Num ? 0x600 : 0x200];
     u16* extpal = GPU2D.GetOBJExtPal();
@@ -1039,6 +1084,7 @@ void SoftRenderer2D::DrawSprites(u32 line)
     }
 
     NumSprites = 0;
+    OBJOpaquePrios = 0;
     memset(OBJLine, 0, sizeof(OBJLine));
     memset(OBJWindow, 0, sizeof(OBJWindow));
 
@@ -1132,6 +1178,7 @@ void SoftRenderer2D::DrawSpritePixel(int color, u32 pixelattr, s32 xpos)
         if (newisopaque && (!oldisopaque || priocheck))
         {
             OBJLine[xpos] = color | pixelattr;
+            OBJOpaquePrios |= 1u << ((pixelattr & OBJ_BGPrioMask) >> 16);
         }
         else if (!newisopaque && !oldisopaque)
         {
