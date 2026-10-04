@@ -3448,6 +3448,14 @@ void NDS::ARM9IOWrite16(u32 addr, u16 val)
 
 void NDS::ARM9IOWrite32(u32 addr, u32 val)
 {
+    // the geometry engine's command ports are by far the most frequent I/O
+    // writes in 3D games; none of the cases below handle them, so skip the switch
+    if (addr >= 0x04000400 && addr < 0x040005CC)
+    {
+        GPU.GPU3D.Write32(addr, val);
+        return;
+    }
+
     switch (addr)
     {
     case 0x04000004:

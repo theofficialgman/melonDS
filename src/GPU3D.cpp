@@ -2825,6 +2825,22 @@ void GPU3D::Write32(u32 addr, u32 val) noexcept
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
 
+    // command ports first: no case in the switch below covers these addresses
+    if (addr >= 0x04000400 && addr < 0x04000440)
+    {
+        WriteToGXFIFO(val);
+        return;
+    }
+
+    if (addr >= 0x04000440 && addr < 0x040005CC)
+    {
+        CmdFIFOEntry entry;
+        entry.Command = (addr & 0x1FC) >> 2;
+        entry.Param = val;
+        CmdFIFOWrite(entry);
+        return;
+    }
+
     switch (addr)
     {
     case 0x04000060:
@@ -2873,20 +2889,6 @@ void GPU3D::Write32(u32 addr, u32 val) noexcept
         return;
     }
 
-    if (addr >= 0x04000400 && addr < 0x04000440)
-    {
-        WriteToGXFIFO(val);
-        return;
-    }
-
-    if (addr >= 0x04000440 && addr < 0x040005CC)
-    {
-        CmdFIFOEntry entry;
-        entry.Command = (addr & 0x1FC) >> 2;
-        entry.Param = val;
-        CmdFIFOWrite(entry);
-        return;
-    }
 
     if (addr >= 0x04000330 && addr < 0x04000340)
     {
