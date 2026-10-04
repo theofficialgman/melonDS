@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "NDS.h"
+#include <cstdlib>
 #include "GPU.h"
 
 namespace melonDS
@@ -29,6 +30,18 @@ namespace melonDS
 
 void RenderThreadFunc();
 
+
+void SoftRenderer3D::StopBandThread()
+{
+    if (BandThread)
+    {
+        BandThreadRunning = false;
+        Platform::Semaphore_Post(Sema_BandStart);
+        Platform::Thread_Wait(BandThread);
+        Platform::Thread_Free(BandThread);
+        BandThread = nullptr;
+    }
+}
 
 void SoftRenderer3D::StopRenderThread()
 {
@@ -43,6 +56,9 @@ void SoftRenderer3D::StopRenderThread()
         Platform::Thread_Free(RenderThread);
         RenderThread = nullptr;
     }
+
+    // the render thread has finished its frame, so the band thread is idle
+    StopBandThread();
 }
 
 void SoftRenderer3D::SetupRenderThread()
@@ -54,6 +70,16 @@ void SoftRenderer3D::SetupRenderThread()
             RenderThreadRunning = true; // "Time for work, render thread!"
             RenderThread = Platform::Thread_Create([this]() {
                 RenderThreadFunc();
+            });
+        }
+
+        if (BandsEnabled && !BandThread)
+        {
+            Platform::Semaphore_Reset(Sema_BandStart);
+            Platform::Semaphore_Reset(Sema_BandRow);
+            BandThreadRunning = true;
+            BandThread = Platform::Thread_Create([this]() {
+                BandThreadFunc();
             });
         }
 
@@ -101,6 +127,12 @@ SoftRenderer3D::SoftRenderer3D(melonDS::GPU3D& gpu3D, SoftRenderer& parent) noex
     Sema_RenderStart = Platform::Semaphore_Create();
     Sema_RenderDone = Platform::Semaphore_Create();
     Sema_ScanlineCount = Platform::Semaphore_Create();
+    Sema_BandStart = Platform::Semaphore_Create();
+    Sema_BandRow = Platform::Semaphore_Create();
+
+    // MELONDS_SOFT3D_BANDS=0 turns the two-thread band split off
+    const char* bands = getenv("MELONDS_SOFT3D_BANDS");
+    BandsEnabled = !(bands && bands[0] == '0') && std::thread::hardware_concurrency() >= 3;
 
     RenderThreadRunning = false;
     RenderThreadRendering = false;
@@ -114,6 +146,8 @@ SoftRenderer3D::~SoftRenderer3D()
     Platform::Semaphore_Free(Sema_RenderStart);
     Platform::Semaphore_Free(Sema_RenderDone);
     Platform::Semaphore_Free(Sema_ScanlineCount);
+    Platform::Semaphore_Free(Sema_BandStart);
+    Platform::Semaphore_Free(Sema_BandRow);
 }
 
 void SoftRenderer3D::Reset()
@@ -122,7 +156,7 @@ void SoftRenderer3D::Reset()
     memset(DepthBuffer, 0, BufferSize * 2 * 4);
     memset(AttrBuffer, 0, BufferSize * 2 * 4);
 
-    PrevIsShadowMask = false;
+    MainCtx.PrevIsShadowMask = false;
 
     SetupRenderThread();
     EnableRenderThread();
@@ -708,7 +742,7 @@ void SoftRenderer3D::SetupPolygon(SoftRenderer3D::RendererPolygon* rp, Polygon* 
     }
 }
 
-void SoftRenderer3D::RenderShadowMaskScanline(RendererPolygon* rp, s32 y)
+void SoftRenderer3D::RenderShadowMaskScanline(ScanlineCtx& ctx, RendererPolygon* rp, s32 y)
 {
     Polygon* polygon = rp->PolyData;
 
@@ -726,10 +760,13 @@ void SoftRenderer3D::RenderShadowMaskScanline(RendererPolygon* rp, s32 y)
     else
         fnDepthTest = DepthTest_LessThan;
 
-    if (!PrevIsShadowMask)
-        memset(&StencilBuffer[256 * (y&0x1)], 0, 256);
+    if (!ctx.PrevIsShadowMask)
+    {
+        memset(&ctx.Stencil[256 * (y&0x1)], 0, 256);
+        ctx.ClearedMask |= 1 << (y&0x1);
+    }
 
-    PrevIsShadowMask = true;
+    ctx.PrevIsShadowMask = true;
 
     if (polygon->YTop != polygon->YBottom)
     {
@@ -870,13 +907,13 @@ void SoftRenderer3D::RenderShadowMaskScanline(RendererPolygon* rp, s32 y)
         u32 dstattr = AttrBuffer[pixeladdr];
 
         if (!fnDepthTest(DepthBuffer[pixeladdr], z, dstattr))
-            StencilBuffer[256*(y&0x1) + x] = 1;
+            ctx.Stencil[256*(y&0x1) + x] = 1;
 
         if (dstattr & 0xF)
         {
             pixeladdr += BufferSize;
             if (!fnDepthTest(DepthBuffer[pixeladdr], z, AttrBuffer[pixeladdr]))
-                StencilBuffer[256*(y&0x1) + x] |= 0x2;
+                ctx.Stencil[256*(y&0x1) + x] |= 0x2;
         }
     }
 
@@ -896,13 +933,13 @@ void SoftRenderer3D::RenderShadowMaskScanline(RendererPolygon* rp, s32 y)
         u32 dstattr = AttrBuffer[pixeladdr];
 
         if (!fnDepthTest(DepthBuffer[pixeladdr], z, dstattr))
-            StencilBuffer[256*(y&0x1) + x] = 1;
+            ctx.Stencil[256*(y&0x1) + x] = 1;
 
         if (dstattr & 0xF)
         {
             pixeladdr += BufferSize;
             if (!fnDepthTest(DepthBuffer[pixeladdr], z, AttrBuffer[pixeladdr]))
-                StencilBuffer[256*(y&0x1) + x] |= 0x2;
+                ctx.Stencil[256*(y&0x1) + x] |= 0x2;
         }
     }
 
@@ -922,13 +959,13 @@ void SoftRenderer3D::RenderShadowMaskScanline(RendererPolygon* rp, s32 y)
         u32 dstattr = AttrBuffer[pixeladdr];
 
         if (!fnDepthTest(DepthBuffer[pixeladdr], z, dstattr))
-            StencilBuffer[256*(y&0x1) + x] = 1;
+            ctx.Stencil[256*(y&0x1) + x] = 1;
 
         if (dstattr & 0xF)
         {
             pixeladdr += BufferSize;
             if (!fnDepthTest(DepthBuffer[pixeladdr], z, AttrBuffer[pixeladdr]))
-                StencilBuffer[256*(y&0x1) + x] |= 0x2;
+                ctx.Stencil[256*(y&0x1) + x] |= 0x2;
         }
     }
 
@@ -936,7 +973,7 @@ void SoftRenderer3D::RenderShadowMaskScanline(RendererPolygon* rp, s32 y)
     rp->XR = rp->SlopeR.Step();
 }
 
-void SoftRenderer3D::RenderPolygonScanline(RendererPolygon* rp, s32 y)
+void SoftRenderer3D::RenderPolygonScanline(ScanlineCtx& ctx, RendererPolygon* rp, s32 y)
 {
     Polygon* polygon = rp->PolyData;
 
@@ -954,7 +991,7 @@ void SoftRenderer3D::RenderPolygonScanline(RendererPolygon* rp, s32 y)
     else
         fnDepthTest = DepthTest_LessThan;
 
-    PrevIsShadowMask = false;
+    ctx.PrevIsShadowMask = false;
 
     if (polygon->YTop != polygon->YBottom)
     {
@@ -1122,7 +1159,7 @@ void SoftRenderer3D::RenderPolygonScanline(RendererPolygon* rp, s32 y)
         // check stencil buffer for shadows
         if (polygon->IsShadow)
         {
-            u8 stencil = StencilBuffer[256*(y&0x1) + x];
+            u8 stencil = ctx.Stencil[256*(y&0x1) + x];
             if (!stencil)
                 continue;
             if (!(stencil & 0x1))
@@ -1218,7 +1255,7 @@ void SoftRenderer3D::RenderPolygonScanline(RendererPolygon* rp, s32 y)
         // check stencil buffer for shadows
         if (polygon->IsShadow)
         {
-            u8 stencil = StencilBuffer[256*(y&0x1) + x];
+            u8 stencil = ctx.Stencil[256*(y&0x1) + x];
             if (!stencil)
                 continue;
             if (!(stencil & 0x1))
@@ -1310,7 +1347,7 @@ void SoftRenderer3D::RenderPolygonScanline(RendererPolygon* rp, s32 y)
         // check stencil buffer for shadows
         if (polygon->IsShadow)
         {
-            u8 stencil = StencilBuffer[256*(y&0x1) + x];
+            u8 stencil = ctx.Stencil[256*(y&0x1) + x];
             if (!stencil)
                 continue;
             if (!(stencil & 0x1))
@@ -1441,18 +1478,17 @@ void SoftRenderer3D::BuildScanlinePolygonLists(int npolys)
     }
 }
 
-void SoftRenderer3D::RenderScanline(s32 y, int npolys)
+void SoftRenderer3D::RenderScanline(ScanlineCtx& ctx, s32 y)
 {
-    (void)npolys;
     for (u32 k = ScanlineStart[y]; k < ScanlineStart[y+1]; k++)
     {
-        RendererPolygon* rp = &PolygonList[ScanlinePolys[k]];
+        RendererPolygon* rp = &ctx.Polys[ScanlinePolys[k]];
         Polygon* polygon = rp->PolyData;
 
         if (polygon->IsShadowMask)
-            RenderShadowMaskScanline(rp, y);
+            RenderShadowMaskScanline(ctx, rp, y);
         else
-            RenderPolygonScanline(rp, y);
+            RenderPolygonScanline(ctx, rp, y);
     }
 }
 
@@ -1754,6 +1790,136 @@ void SoftRenderer3D::ClearBuffers()
     }
 }
 
+// Where the frame can be cut in two for the band split, or 0 if it can't.
+//
+// The only rasterizer state that crosses scanlines (besides per-polygon edge
+// state, which can be rebuilt for any row) is the shadow stencil buffer and
+// the "previous polygon was a shadow mask" flag. A shadow mask polygon only
+// clears the stencil row when the previous polygon was not a mask, so rows can
+// read or extend stencil data left by rows above them. The band thread can't
+// reproduce that without rendering those rows, so cut only where the band's
+// stencil use starts from a cleared row. Everything is decided from the
+// polygon lists; nothing is rendered.
+int SoftRenderer3D::ChooseBandSplit(int npolys)
+{
+    (void)npolys;
+    const u32 total = ScanlineStart[192];
+    if (total < 256) return 0; // too little work to be worth a second thread
+
+    // flag state after the nearest non-empty row above `row`
+    auto prevFlagBefore = [&](int row) -> bool
+    {
+        for (int r = row - 1; r >= 0; r--)
+        {
+            if (ScanlineStart[r+1] > ScanlineStart[r])
+                return MainCtx.Polys[ScanlinePolys[ScanlineStart[r+1]-1]].PolyData->IsShadowMask;
+        }
+        return MainCtx.PrevIsShadowMask;
+    };
+
+    auto safeAt = [&](int m) -> bool
+    {
+        bool P = prevFlagBefore(m);
+        bool defined[2] = {false, false};
+        for (int r = m; r < 192 && !(defined[0] && defined[1]); r++)
+        {
+            const int par = r & 1;
+            bool cleared = defined[par];
+            for (u32 k = ScanlineStart[r]; k < ScanlineStart[r+1]; k++)
+            {
+                const Polygon* poly = MainCtx.Polys[ScanlinePolys[k]].PolyData;
+                if (poly->IsShadowMask)
+                {
+                    if (!cleared)
+                    {
+                        if (P) return false; // would extend stale stencil from above
+                        cleared = true;
+                    }
+                    P = true;
+                }
+                else
+                {
+                    if (poly->IsShadow && !cleared) return false; // reads stale stencil
+                    P = false;
+                }
+            }
+            if (cleared) defined[par] = true;
+        }
+        return true;
+    };
+
+    // balance the two halves by polygon-row count
+    int target = 96;
+    for (int y = 0; y < 192; y++)
+    {
+        if (ScanlineStart[y] * 2 >= total) { target = y; break; }
+    }
+
+    for (int d = 0; d <= 40; d++)
+    {
+        int cand[2] = {target + d, target - d};
+        for (int i = 0; i < (d ? 2 : 1); i++)
+        {
+            int m = cand[i];
+            if (m < 24 || m > 168) continue;
+            if (safeAt(m)) return m;
+        }
+    }
+    return 0;
+}
+
+// Give the band thread its own copy of the polygons, with edge state as of `firstrow`.
+void SoftRenderer3D::PrepareBand(int npolys, int firstrow)
+{
+    BandFirstRow = firstrow;
+
+    memcpy(BandPolygonList, PolygonList, sizeof(RendererPolygon) * npolys);
+    BandCtx.Polys = BandPolygonList;
+
+    for (int i = 0; i < npolys; i++)
+    {
+        RendererPolygon* rp = &BandPolygonList[i];
+        const Polygon* polygon = rp->PolyData;
+
+        // polygons that started above the band need their edges brought to this row
+        // (slope state is plain integer arithmetic, so this matches stepping down to it)
+        if (polygon->YTop < firstrow && polygon->YBottom > firstrow &&
+            polygon->YTop != polygon->YBottom)
+        {
+            SetupPolygonLeftEdge(rp, firstrow);
+            SetupPolygonRightEdge(rp, firstrow);
+        }
+    }
+
+    // state the band starts in: what the rows above leave behind
+    bool P = MainCtx.PrevIsShadowMask;
+    for (int r = firstrow - 1; r >= 0; r--)
+    {
+        if (ScanlineStart[r+1] > ScanlineStart[r])
+        {
+            P = PolygonList[ScanlinePolys[ScanlineStart[r+1]-1]].PolyData->IsShadowMask;
+            break;
+        }
+    }
+    BandCtx.PrevIsShadowMask = P;
+    BandCtx.ClearedMask = 0;
+}
+
+void SoftRenderer3D::BandThreadFunc()
+{
+    for (;;)
+    {
+        Platform::Semaphore_Wait(Sema_BandStart);
+        if (!BandThreadRunning) return;
+
+        for (s32 y = BandFirstRow; y < 192; y++)
+        {
+            RenderScanline(BandCtx, y);
+            Platform::Semaphore_Post(Sema_BandRow);
+        }
+    }
+}
+
 void SoftRenderer3D::RenderPolygons(bool threaded, Polygon** polygons, int npolys)
 {
     int j = 0;
@@ -1763,13 +1929,27 @@ void SoftRenderer3D::RenderPolygons(bool threaded, Polygon** polygons, int npoly
         SetupPolygon(&PolygonList[j++], polygons[i]);
     }
 
+    MainCtx.Polys = PolygonList;
     BuildScanlinePolygonLists(j);
 
-    RenderScanline(0, j);
+    // Threaded frames can rasterize the bottom band on a second thread.
+    int split = 0;
+    if (threaded && BandThread && BandThreadRunning.load(std::memory_order_relaxed))
+        split = ChooseBandSplit(j);
 
-    for (s32 y = 1; y < 192; y++)
+    if (split)
     {
-        RenderScanline(y, j);
+        PrepareBand(j, split);
+        Platform::Semaphore_Post(Sema_BandStart);
+    }
+
+    const int toprows = split ? split : 192;
+
+    RenderScanline(MainCtx, 0);
+
+    for (s32 y = 1; y < toprows; y++)
+    {
+        RenderScanline(MainCtx, y);
         ScanlineFinalPass(y-1);
 
         if (threaded)
@@ -1777,11 +1957,42 @@ void SoftRenderer3D::RenderPolygons(bool threaded, Polygon** polygons, int npoly
             Platform::Semaphore_Post(Sema_ScanlineCount);
     }
 
-    ScanlineFinalPass(191);
+    if (!split)
+    {
+        ScanlineFinalPass(191);
 
-    if (threaded)
-        // If this renderer is threaded, notify the main thread that we're done with the frame.
-        Platform::Semaphore_Post(Sema_ScanlineCount);
+        if (threaded)
+            // If this renderer is threaded, notify the main thread that we're done with the frame.
+            Platform::Semaphore_Post(Sema_ScanlineCount);
+    }
+    else
+    {
+        // The remaining final passes need the rows below them, which the band
+        // thread is producing. They stay on this thread and in order so the
+        // consumer still sees scanlines complete top to bottom.
+        int bandrows = 192 - split;
+        int got = 0;
+        for (s32 y = toprows - 1; y < 192; y++)
+        {
+            int need = (y + 1 <= 191) ? (y + 1 - split + 1) : bandrows;
+            while (got < need)
+            {
+                Platform::Semaphore_Wait(Sema_BandRow);
+                got++;
+            }
+
+            ScanlineFinalPass(y);
+            Platform::Semaphore_Post(Sema_ScanlineCount);
+        }
+
+        // carry the cross-frame stencil state forward exactly as a single thread would
+        MainCtx.PrevIsShadowMask = BandCtx.PrevIsShadowMask;
+        for (int par = 0; par < 2; par++)
+        {
+            if (BandCtx.ClearedMask & (1 << par))
+                memcpy(&MainCtx.Stencil[256*par], &BandCtx.Stencil[256*par], 256);
+        }
+    }
 }
 
 void SoftRenderer3D::FinishRendering()

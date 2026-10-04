@@ -447,6 +447,16 @@ private:
 
     RendererPolygon PolygonList[2048];
 
+    // Rasterizer state that persists from one scanline to the next. Each
+    // render thread has its own copy (see the band split in RenderPolygons).
+    struct ScanlineCtx
+    {
+        RendererPolygon* Polys = nullptr; // this thread's set-up polygons
+        u8 Stencil[256*2];                // shadow stencil, two interleaved rows
+        bool PrevIsShadowMask = false;    // the last polygon drawn was a shadow mask
+        u8 ClearedMask = 0;               // bit n: stencil row parity n was cleared
+    };
+
     // The polygons that cross each scanline, in polygon order. Built once per
     // frame so that RenderScanline() doesn't have to test every polygon on
     // every line.
@@ -459,9 +469,13 @@ private:
     void SetupPolygonLeftEdge(RendererPolygon* rp, s32 y) const;
     void SetupPolygonRightEdge(RendererPolygon* rp, s32 y) const;
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
-    void RenderShadowMaskScanline(RendererPolygon* rp, s32 y);
-    void RenderPolygonScanline(RendererPolygon* rp, s32 y);
-    void RenderScanline(s32 y, int npolys);
+    void RenderShadowMaskScanline(ScanlineCtx& ctx, RendererPolygon* rp, s32 y);
+    void RenderPolygonScanline(ScanlineCtx& ctx, RendererPolygon* rp, s32 y);
+    void RenderScanline(ScanlineCtx& ctx, s32 y);
+    int ChooseBandSplit(int npolys);
+    void PrepareBand(int npolys, int firstrow);
+    void BandThreadFunc();
+    void StopBandThread();
     u32 CalculateFogDensity(u32 pixeladdr) const;
     void ScanlineFinalPass(s32 y);
     void ClearBuffers();
@@ -493,8 +507,9 @@ private:
     // bit22: translucent flag
     // bit24-29: polygon ID for opaque pixels
 
-    u8 StencilBuffer[256*2];
-    bool PrevIsShadowMask;
+    ScanlineCtx MainCtx;
+    ScanlineCtx BandCtx;
+    RendererPolygon BandPolygonList[2048];
 
     bool Enabled;
 
@@ -514,6 +529,15 @@ private:
 
     // Used by the render thread to tell the main thread that it's done rendering a frame
     Platform::Semaphore* Sema_RenderDone;
+
+    // Second render thread: rasterizes the bottom band of the frame while the
+    // render thread above does the top band, then the final passes.
+    Platform::Thread* BandThread = nullptr;
+    std::atomic_bool BandThreadRunning{false};
+    Platform::Semaphore* Sema_BandStart = nullptr; // render thread -> band thread: go
+    Platform::Semaphore* Sema_BandRow = nullptr;   // band thread -> render thread: one row done
+    int BandFirstRow = 0;
+    bool BandsEnabled = true;
 
     // Used to allow the main thread to read some scanlines
     // before (the 3D portion of) the entire frame is rasterized.
