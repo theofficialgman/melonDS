@@ -318,17 +318,42 @@ void SoftRenderer2D::DrawScanline_BGOBJ(u32 line, u32* dst)
 
         backdrop = r | (g << 8) | (b << 16) | 0x20000000;
         backdrop |= (backdrop << 32);
-
-        for (int i = 0; i < 256; i+=2)
-            *(u64*)&BGOBJLine[i] = backdrop;
-        for (int i = 256; i < 512; i+=2)
-            *(u64*)&BGOBJLine[i] = 0;
     }
 
+    // (this also advances the window state that is carried from line to line,
+    // so it has to run even when the result turns out not to be needed)
     if (GPU2D.DispCnt & 0xE000)
         GPU2D.CalculateWindowMask(WindowMask, OBJWindow);
     else
         memset(WindowMask, 0xFF, 256);
+
+    // Common case on the top screen of 3D games: the only thing drawn is the 3D
+    // layer (BG0), no sprite lands on this line and no color effect can apply.
+    // The full pipeline then reduces to "3D pixel if present and allowed by the
+    // window, else the backdrop", so skip the layer buffers entirely.
+    {
+        const u32 blendCnt = GPU2D.BlendCnt;
+        if (!GPU2D.Num && (GPU2D.DispCnt & 0x8) && (GPU2D.DispCnt & 0x7) < 6 &&
+            (GPU2D.LayerEnable & 0x0F) == 0x01 &&
+            (!(GPU2D.LayerEnable & 0x10) || !NumSprites) &&
+            (blendCnt & 0x3F00) == 0 && ((blendCnt >> 6) & 0x3) < 2)
+        {
+            const u32 backdrop32 = (u32)backdrop;
+            const u32* src = Parent.Output3D;
+            for (int i = 0; i < 256; i++)
+            {
+                u32 c = src[i];
+                bool use = ((c >> 24) != 0) && (WindowMask[i] & 0x01);
+                dst[i] = use ? (c | 0x40000000) : backdrop32;
+            }
+            return;
+        }
+    }
+
+    for (int i = 0; i < 256; i+=2)
+        *(u64*)&BGOBJLine[i] = backdrop;
+    for (int i = 256; i < 512; i+=2)
+        *(u64*)&BGOBJLine[i] = 0;
 
     ApplySpriteMosaicX();
     CurBGXMosaicTable = MosaicTable[GPU2D.BGMosaicSize[0]].data();
