@@ -1027,7 +1027,7 @@ void SoftRenderer2D::ApplySpriteMosaicX()
      */
 
     u8 mosw = GPU2D.OBJMosaicSize[0];
-    if (mosw == 0) return;
+    if (mosw == 0 || NumSprites == 0) return; // OBJLine is all zero without sprites
 
     u8 mosx = 0;
     u32 latchcolor;
