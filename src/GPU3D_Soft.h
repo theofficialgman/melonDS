@@ -23,6 +23,7 @@
 #include "Platform.h"
 #include <thread>
 #include <atomic>
+#include <vector>
 
 namespace melonDS
 {
@@ -445,6 +446,13 @@ private:
     };
 
     RendererPolygon PolygonList[2048];
+
+    // The polygons that cross each scanline, in polygon order. Built once per
+    // frame so that RenderScanline() doesn't have to test every polygon on
+    // every line.
+    std::vector<u16> ScanlinePolys;
+    u32 ScanlineStart[193];
+    void BuildScanlinePolygonLists(int npolys);
     void TextureLookup(u32 texparam, u32 texpal, s16 s, s16 t, u16* color, u8* alpha) const;
     u32 RenderPixel(const Polygon* polygon, u8 vr, u8 vg, u8 vb, s16 s, s16 t) const;
     void PlotTranslucentPixel(u32 pixeladdr, u32 color, u32 z, u32 polyattr, u32 shadow);

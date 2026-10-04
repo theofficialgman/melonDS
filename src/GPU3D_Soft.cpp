@@ -1394,20 +1394,65 @@ void SoftRenderer3D::RenderPolygonScanline(RendererPolygon* rp, s32 y)
     rp->XR = rp->SlopeR.Step();
 }
 
-void SoftRenderer3D::RenderScanline(s32 y, int npolys)
+void SoftRenderer3D::BuildScanlinePolygonLists(int npolys)
 {
+    // A polygon is drawn on line y when
+    //   y >= YTop && (y < YBottom || (y == YTop && YBottom == YTop))
+    // i.e. on [YTop, YBottom), or only on YTop for a zero-height polygon.
+    auto lineRange = [](const Polygon* poly, s32& y0, s32& y1)
+    {
+        y0 = poly->YTop;
+        y1 = (poly->YBottom == poly->YTop) ? (y0 + 1) : poly->YBottom;
+        if (y0 < 0) y0 = 0;
+        if (y1 > 192) y1 = 192;
+    };
+
+    u32 count[192] = {};
     for (int i = 0; i < npolys; i++)
     {
-        RendererPolygon* rp = &PolygonList[i];
+        s32 y0, y1;
+        lineRange(PolygonList[i].PolyData, y0, y1);
+        for (s32 y = y0; y < y1; y++)
+            count[y]++;
+    }
+
+    u32 total = 0;
+    for (int y = 0; y < 192; y++)
+    {
+        ScanlineStart[y] = total;
+        total += count[y];
+    }
+    ScanlineStart[192] = total;
+
+    if (ScanlinePolys.size() < total)
+        ScanlinePolys.resize(total);
+
+    u32 fill[192];
+    for (int y = 0; y < 192; y++)
+        fill[y] = ScanlineStart[y];
+
+    // polygons are appended in ascending index order, which preserves draw order per line
+    for (int i = 0; i < npolys; i++)
+    {
+        s32 y0, y1;
+        lineRange(PolygonList[i].PolyData, y0, y1);
+        for (s32 y = y0; y < y1; y++)
+            ScanlinePolys[fill[y]++] = (u16)i;
+    }
+}
+
+void SoftRenderer3D::RenderScanline(s32 y, int npolys)
+{
+    (void)npolys;
+    for (u32 k = ScanlineStart[y]; k < ScanlineStart[y+1]; k++)
+    {
+        RendererPolygon* rp = &PolygonList[ScanlinePolys[k]];
         Polygon* polygon = rp->PolyData;
 
-        if (y >= polygon->YTop && (y < polygon->YBottom || (y == polygon->YTop && polygon->YBottom == polygon->YTop)))
-        {
-            if (polygon->IsShadowMask)
-                RenderShadowMaskScanline(rp, y);
-            else
-                RenderPolygonScanline(rp, y);
-        }
+        if (polygon->IsShadowMask)
+            RenderShadowMaskScanline(rp, y);
+        else
+            RenderPolygonScanline(rp, y);
     }
 }
 
@@ -1717,6 +1762,8 @@ void SoftRenderer3D::RenderPolygons(bool threaded, Polygon** polygons, int npoly
         if (polygons[i]->Degenerate) continue;
         SetupPolygon(&PolygonList[j++], polygons[i]);
     }
+
+    BuildScanlinePolygonLists(j);
 
     RenderScanline(0, j);
 
