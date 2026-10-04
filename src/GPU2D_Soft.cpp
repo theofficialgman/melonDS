@@ -875,16 +875,25 @@ void SoftRenderer2D::DrawBG_Extended(u32 line, u32 bgnum)
                     }
 
                     // draw pixel
-                    u32 tilexoff = (finalX >> 8) & 0x7;
-                    u32 tileyoff = (finalY >> 8) & 0x7;
-
-                    if (curtile & (1<<10)) tilexoff = 7-tilexoff;
-                    if (curtile & (1<<11)) tileyoff = 7-tileyoff;
+                    // (7-x == x^7 for x in 0..7, so the flips need no branch)
+                    u32 tilexoff = ((finalX >> 8) & 0x7) ^ (((curtile >> 10) & 1) * 7);
+                    u32 tileyoff = ((finalY >> 8) & 0x7) ^ (((curtile >> 11) & 1) * 7);
 
                     color = bgvram[(tilesetaddr + ((curtile & 0x03FF) << 6) + (tileyoff << 3) + tilexoff) & bgvrammask];
 
-                    if (color)
-                        DrawPixel(&BGOBJLine[i], curpal[color], 0x01000000<<bgnum);
+                    // Transparent pixels are data dependent and unpredictable on a
+                    // scrolling/rotating map, so select instead of branching:
+                    // an opaque pixel pushes the old top pixel down one layer.
+                    u16 pc = curpal[color];
+                    u32 newpix = (u32)((pc & 0x001F) << 1) |
+                                 ((u32)(((pc & 0x03E0) >> 4) | ((pc & 0x8000) >> 15)) << 8) |
+                                 ((u32)((pc & 0x7C00) >> 9) << 16) |
+                                 (0x01000000u << bgnum);
+                    u32 oldtop = BGOBJLine[i];
+                    u32 oldsecond = BGOBJLine[i+256];
+                    bool opaque = (color != 0);
+                    BGOBJLine[i+256] = opaque ? oldtop : oldsecond;
+                    BGOBJLine[i] = opaque ? newpix : oldtop;
                 }
             }
 
